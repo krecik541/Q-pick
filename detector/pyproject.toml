@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "detector"
+version = "0.1.0"
+
+[tool.setuptools.packages.find]
+# Ta opcja sprawi, że 'detector' będzie głównym modułem, 
+# a wszystko w środku będzie importowane przez detector.cośtam
+where = ["."]
+include = ["models*", "GroundingDINO*"]
