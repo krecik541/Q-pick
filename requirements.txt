@@ -1,0 +1,17 @@
+torch
+torchvision
+transformers>=4.45.0
+opencv-python
+numpy
+pillow
+tqdm
+scikit-learn
+addict
+yapf
+timm
+supervision>=0.22.0
+pycocotools
+sentencepiece
+tokenizers
+huggingface_hub
+ultralytics
