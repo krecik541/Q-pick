@@ -23,7 +23,12 @@ class DecisionEngine:
                 "detected_product": product,
                 "score": score,
                 "is_match": is_match,
-                "target_match": (product == target_product) if target_product else None
+                "target_match": (product == target_product) if target_product else None,
+                "final_score": float(getattr(det, 'final_score', score)),
+                "crop_score": float(getattr(det, 'crop_score', 0.0)),
+                "embed_score": float(best.get('embed_score', score)),
+                "margin": best.get('margin'),
+                "color_score": float(best.get('color_score', 0.0))
             })
 
         return decisions

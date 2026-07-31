@@ -11,6 +11,7 @@ from do_3_razy_sztuka.models.reference_db import ReferenceDatabase
 from do_3_razy_sztuka.pipeline.product_localizer import ProductLocalizer
 from do_3_razy_sztuka.pipeline.decision_engine import DecisionEngine
 from do_3_razy_sztuka.utils.visualization import Visualizer
+import json
 
 
 def main():
@@ -105,6 +106,15 @@ def main():
     print("======================")
 
     print(response)
+
+    # save detections metadata to debug dir for inspection
+    try:
+        out_json = debug_dir / "detections_metadata.json"
+        with open(out_json, 'w', encoding='utf-8') as f:
+            json.dump(response, f, ensure_ascii=False, indent=2)
+        print(f"Wrote detections metadata to {out_json}")
+    except Exception as e:
+        print("Warning: failed to write detections metadata:", e)
 
     return response
 

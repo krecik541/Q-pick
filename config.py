@@ -36,6 +36,9 @@ DEFAULT_DEBUG_DIR = OUTPUT_DIR / "debug"
 # Global toggle to enable/disable saving/reading local caches (set False to disable caching)
 ENABLE_CACHING = False
 
+# Allow toggling per-class overrides via environment variable (useful for experiments)
+USE_PER_CLASS = os.environ.get('USE_PER_CLASS', '1') == '1'
+
 os.environ.setdefault("HF_HOME", str(HF_CACHE_DIR))
 os.environ.setdefault("TRANSFORMERS_CACHE", str(HF_CACHE_DIR))
 os.environ.setdefault("HUGGINGFACE_HUB_CACHE", str(HF_CACHE_DIR))
@@ -92,3 +95,16 @@ COLOR_HIST_WEIGHT = 2.5
 
 # Final score threshold to accept a detection (combined score)
 FINAL_SCORE_THRESHOLD = 0.65
+
+# Per-class overrides: map product identifier -> dict of weight/threshold overrides
+# Example: give much higher color weight for 'lays_paprika'
+PER_CLASS_CONFIG = {
+    "lays_paprika": {
+        "COLOR_HIST_WEIGHT": 4.0,
+        "EMBED_WEIGHT": 2.0,
+        "MARGIN_WEIGHT": 1.0,
+        "CROP_QUALITY_WEIGHT": 1.0,
+        "FINAL_SCORE_THRESHOLD": 0.60,
+    },
+    # add more product-specific overrides here as needed
+}

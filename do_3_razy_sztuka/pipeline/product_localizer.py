@@ -113,6 +113,29 @@ def color_histogram(img):
         return None
 
 
+def _get_weights_for_product(product):
+    # return tuple: (embed_w, margin_w, crop_w, color_w, final_threshold)
+    embed_w = cfg.EMBED_WEIGHT
+    margin_w = cfg.MARGIN_WEIGHT
+    crop_w = cfg.CROP_QUALITY_WEIGHT
+    color_w = cfg.COLOR_HIST_WEIGHT
+    thresh = cfg.FINAL_SCORE_THRESHOLD
+
+    try:
+        if product and getattr(cfg, 'USE_PER_CLASS', True) and hasattr(cfg, 'PER_CLASS_CONFIG'):
+            pc = cfg.PER_CLASS_CONFIG.get(product)
+            if pc:
+                embed_w = pc.get('EMBED_WEIGHT', embed_w)
+                margin_w = pc.get('MARGIN_WEIGHT', margin_w)
+                crop_w = pc.get('CROP_QUALITY_WEIGHT', crop_w)
+                color_w = pc.get('COLOR_HIST_WEIGHT', color_w)
+                thresh = pc.get('FINAL_SCORE_THRESHOLD', thresh)
+    except Exception:
+        pass
+
+    return float(embed_w), float(margin_w), float(crop_w), float(color_w), float(thresh)
+
+
 class ProductLocalizer:
 
     def __init__(self, embedder, reference_db):
@@ -175,6 +198,9 @@ class ProductLocalizer:
                     det.best_match = {
                         "product": target_product,
                         "score": score,
+                        "embed_score": score,
+                        "margin": None,
+                        "color_score": color_score,
                     }
                 # color similarity to target product
                 color_score = 0.0
@@ -184,15 +210,16 @@ class ProductLocalizer:
                     color_score = float((corr + 1.0) / 2.0)
 
                 # combine embedding score with crop quality and color similarity into final_score
+                embed_w, margin_w, crop_w, color_w, effective_thresh = _get_weights_for_product(target_product)
                 if det.best_match is not None:
                     embed_score = max(0.0, det.best_match["score"])
                     margin_norm = 0.0
                     det.final_score = (
-                        cfg.EMBED_WEIGHT * embed_score +
-                        cfg.MARGIN_WEIGHT * margin_norm +
-                        cfg.CROP_QUALITY_WEIGHT * det.crop_score +
-                        cfg.COLOR_HIST_WEIGHT * color_score
-                    ) / (cfg.EMBED_WEIGHT + cfg.MARGIN_WEIGHT + cfg.CROP_QUALITY_WEIGHT + cfg.COLOR_HIST_WEIGHT)
+                        embed_w * embed_score +
+                        margin_w * margin_norm +
+                        crop_w * det.crop_score +
+                        color_w * color_score
+                    ) / (embed_w + margin_w + crop_w + color_w)
                 else:
                     det.final_score = det.crop_score
 
@@ -251,12 +278,15 @@ class ProductLocalizer:
                 margin_norm = max(0.0, margin)
                 color_sc = color_scores.get(best_product, 0.0)
 
+                # apply per-product overrides if present
+                embed_w, margin_w, crop_w, color_w, effective_thresh = _get_weights_for_product(best_product)
+
                 det.final_score = (
-                    cfg.EMBED_WEIGHT * embed_norm +
-                    cfg.MARGIN_WEIGHT * margin_norm +
-                    cfg.CROP_QUALITY_WEIGHT * det.crop_score +
-                    cfg.COLOR_HIST_WEIGHT * color_sc
-                ) / (cfg.EMBED_WEIGHT + cfg.MARGIN_WEIGHT + cfg.CROP_QUALITY_WEIGHT + cfg.COLOR_HIST_WEIGHT)
+                    embed_w * embed_norm +
+                    margin_w * margin_norm +
+                    crop_w * det.crop_score +
+                    color_w * color_sc
+                ) / (embed_w + margin_w + crop_w + color_w)
 
 
             w = x2 - x1
@@ -295,10 +325,20 @@ class ProductLocalizer:
                 if det.best_match["product"] != winner:
                     det.best_match = None
 
-        detections = [
-            d for d in detections
-            if d.best_match and getattr(d, 'final_score', d.best_match.get("score", 0.0)) > cfg.FINAL_SCORE_THRESHOLD
-        ]
+        # filter using per-class threshold when available
+        def _passes_threshold(d):
+            if not d.best_match:
+                return False
+            prod = d.best_match.get('product')
+            thr = cfg.FINAL_SCORE_THRESHOLD
+            try:
+                if prod and hasattr(cfg, 'PER_CLASS_CONFIG'):
+                    thr = cfg.PER_CLASS_CONFIG.get(prod, {}).get('FINAL_SCORE_THRESHOLD', thr)
+            except Exception:
+                pass
+            return float(getattr(d, 'final_score', d.best_match.get('score', 0.0))) > float(thr)
+
+        detections = [d for d in detections if _passes_threshold(d)]
 
         detections.sort(
             key=lambda d: getattr(d, 'final_score', d.best_match.get("score", 0.0)),
