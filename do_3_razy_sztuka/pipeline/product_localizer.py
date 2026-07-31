@@ -1,8 +1,116 @@
 from PIL import Image
 import cv2
 from collections import Counter
+from typing import List
 
 from do_3_razy_sztuka.models.matcher import ProductMatcher
+import config as cfg
+import numpy as np
+
+
+def box_iou(a, b):
+    # a, b = (x1,y1,x2,y2)
+    xA = max(a[0], b[0])
+    yA = max(a[1], b[1])
+    xB = min(a[2], b[2])
+    yB = min(a[3], b[3])
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    inter = interW * interH
+    areaA = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+    areaB = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+    union = areaA + areaB - inter
+    if union <= 0:
+        return 0.0
+    return inter / union
+
+
+def wbf_merge(detections: List[object], iou_thr=0.55, score_thr=0.05):
+    if not detections:
+        return []
+
+    # collect boxes and scores
+    boxes = [tuple(d.bbox) for d in detections]
+    scores = [getattr(d, 'confidence', getattr(d, 'score', 1.0)) for d in detections]
+    order = sorted(range(len(boxes)), key=lambda i: scores[i], reverse=True)
+    visited = [False] * len(boxes)
+    merged = []
+
+    for idx in order:
+        if visited[idx]:
+            continue
+        if scores[idx] < score_thr:
+            continue
+        cluster = [idx]
+        visited[idx] = True
+        for j in order:
+            if visited[j]:
+                continue
+            if scores[j] < score_thr:
+                continue
+            if box_iou(boxes[idx], boxes[j]) >= iou_thr:
+                cluster.append(j)
+                visited[j] = True
+
+        # weighted average coordinates
+        weights = [scores[k] for k in cluster]
+        s = sum(weights) if sum(weights) > 0 else 1.0
+        x1 = sum(boxes[k][0] * w for k, w in zip(cluster, weights)) / s
+        y1 = sum(boxes[k][1] * w for k, w in zip(cluster, weights)) / s
+        x2 = sum(boxes[k][2] * w for k, w in zip(cluster, weights)) / s
+        y2 = sum(boxes[k][3] * w for k, w in zip(cluster, weights)) / s
+
+        # choose representative detection (highest score) and update bbox/conf
+        rep = max(cluster, key=lambda k: scores[k])
+        det = detections[rep]
+        det.bbox = (int(x1), int(y1), int(x2), int(y2))
+        det.confidence = max(scores[k] for k in cluster)
+        merged.append(det)
+
+    return merged
+
+
+def laplacian_variance(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def crop_quality_score(img):
+    # img: BGR numpy array
+    h, w = img.shape[:2]
+    area = float(w * h)
+
+    # sharpness normalized
+    sharp = laplacian_variance(img)
+    sharp_norm = min(1.0, sharp / 100.0)
+
+    # size normalized (favor reasonably large crops)
+    size_norm = min(1.0, area / 20000.0)
+
+    # aspect ratio: prefer near-square or typical product shapes
+    ar = (w / h) if h > 0 else 1.0
+    aspect_norm = float(np.exp(-abs(ar - 1.0)))
+
+    w_sh = cfg.CROP_SHARPNESS_WEIGHT
+    w_sz = cfg.CROP_SIZE_WEIGHT
+    w_ar = cfg.CROP_ASPECT_WEIGHT
+
+    total = w_sh + w_sz + w_ar
+    score = (w_sh * sharp_norm + w_sz * size_norm + w_ar * aspect_norm) / total
+    return float(score)
+
+
+def color_histogram(img):
+    # compute H channel histogram with 16 bins, return normalized vector
+    try:
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        h = hsv[:, :, 0]
+        hist = cv2.calcHist([h], [0], None, [16], [0, 180]).flatten()
+        if hist.sum() > 0:
+            hist = hist / hist.sum()
+        return hist
+    except Exception:
+        return None
 
 
 class ProductLocalizer:
@@ -18,7 +126,6 @@ class ProductLocalizer:
     # -------------------------------------------------
 
     def run(self, detections, target_product=None):
-
         # jeśli użytkownik podał konkretny produkt,
         # pobieramy tylko jego prototyp
         prototype = None
@@ -33,11 +140,21 @@ class ProductLocalizer:
                     f"Available products: {available_products}"
                 )
 
+        # apply postprocessing merge (WBF) early to reduce duplicates
+        if cfg.NMS_TYPE == 'wbf':
+            detections = wbf_merge(detections, iou_thr=cfg.WBF_IOU_THRESHOLD, score_thr=cfg.WBF_SCORE_THRESHOLD)
+
         for det in detections:
             x1, y1, x2, y2 = det.bbox
 
             if det.crop is None:
                 raise ValueError(f"Detection {det.id} is missing crop data")
+
+            # compute crop quality (sharpness / size / aspect)
+            try:
+                det.crop_score = crop_quality_score(det.crop)
+            except Exception:
+                det.crop_score = 0.0
 
             image = Image.fromarray(
                 cv2.cvtColor(det.crop, cv2.COLOR_BGR2RGB)
@@ -46,19 +163,38 @@ class ProductLocalizer:
             embedding = self.embedder.embed_image(image)
 
             det.embedding = embedding
+            # compute color histogram for crop
+            det.color_hist = color_histogram(det.crop)
 
             # ---------- tryb wyszukiwania jednego produktu ----------
             if prototype is not None:
-
                 score = float(embedding @ prototype)
-
-                if score < 0.60:
+                if score < cfg.EMBED_MATCH_THRESHOLD:
                     det.best_match = None
                 else:
                     det.best_match = {
                         "product": target_product,
                         "score": score,
                     }
+                # color similarity to target product
+                color_score = 0.0
+                prod_hist = self.db.product_histograms.get(target_product) if hasattr(self.db, 'product_histograms') else None
+                if det.color_hist is not None and prod_hist is not None:
+                    corr = cv2.compareHist(prod_hist.astype('float32'), det.color_hist.astype('float32'), cv2.HISTCMP_CORREL)
+                    color_score = float((corr + 1.0) / 2.0)
+
+                # combine embedding score with crop quality and color similarity into final_score
+                if det.best_match is not None:
+                    embed_score = max(0.0, det.best_match["score"])
+                    margin_norm = 0.0
+                    det.final_score = (
+                        cfg.EMBED_WEIGHT * embed_score +
+                        cfg.MARGIN_WEIGHT * margin_norm +
+                        cfg.CROP_QUALITY_WEIGHT * det.crop_score +
+                        cfg.COLOR_HIST_WEIGHT * color_score
+                    ) / (cfg.EMBED_WEIGHT + cfg.MARGIN_WEIGHT + cfg.CROP_QUALITY_WEIGHT + cfg.COLOR_HIST_WEIGHT)
+                else:
+                    det.final_score = det.crop_score
 
             # ---------- tryb klasyfikacji (opcjonalny) ----------
             else:
@@ -67,6 +203,17 @@ class ProductLocalizer:
                     product: float(embedding @ proto)
                     for product, proto in self.db.prototypes.items()
                 }
+
+                # compute color similarity for each product if histograms exist
+                color_scores = {}
+                for product in scores.keys():
+                    color_scores[product] = 0.0
+                    prod_hist = None
+                    if hasattr(self.db, 'product_histograms'):
+                        prod_hist = self.db.product_histograms.get(product)
+                    if det.color_hist is not None and prod_hist is not None:
+                        corr = cv2.compareHist(prod_hist.astype('float32'), det.color_hist.astype('float32'), cv2.HISTCMP_CORREL)
+                        color_scores[product] = float((corr + 1.0) / 2.0)
 
                 ordered = sorted(
                     scores.items(),
@@ -80,20 +227,36 @@ class ProductLocalizer:
 
                 margin = best_score - second_score
 
-                if best_score < 0.60:
+
+                if best_score < cfg.EMBED_MATCH_THRESHOLD:
                     det.best_match = None
+                    det.final_score = det.crop_score
                     continue
 
-                if margin < 0.08:
+                if margin < cfg.EMBED_MARGIN_THRESHOLD:
                     det.best_match = None
+                    det.final_score = det.crop_score
                     continue
 
                 det.best_match = {
                     "product": best_product,
                     "score": best_score,
                     "margin": margin,
-                    "scores": scores
+                    "scores": scores,
+                    "color_score": color_scores.get(best_product, 0.0)
                 }
+
+                # combine embedding, margin, crop quality and color similarity into final_score
+                embed_norm = max(0.0, best_score)
+                margin_norm = max(0.0, margin)
+                color_sc = color_scores.get(best_product, 0.0)
+
+                det.final_score = (
+                    cfg.EMBED_WEIGHT * embed_norm +
+                    cfg.MARGIN_WEIGHT * margin_norm +
+                    cfg.CROP_QUALITY_WEIGHT * det.crop_score +
+                    cfg.COLOR_HIST_WEIGHT * color_sc
+                ) / (cfg.EMBED_WEIGHT + cfg.MARGIN_WEIGHT + cfg.CROP_QUALITY_WEIGHT + cfg.COLOR_HIST_WEIGHT)
 
 
             w = x2 - x1
@@ -134,11 +297,11 @@ class ProductLocalizer:
 
         detections = [
             d for d in detections
-            if d.best_match and d.best_match["score"] > 0.55
+            if d.best_match and getattr(d, 'final_score', d.best_match.get("score", 0.0)) > cfg.FINAL_SCORE_THRESHOLD
         ]
 
         detections.sort(
-            key=lambda d: d.best_match["score"],
+            key=lambda d: getattr(d, 'final_score', d.best_match.get("score", 0.0)),
             reverse=True,
         )
 

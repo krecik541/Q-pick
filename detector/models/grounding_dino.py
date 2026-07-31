@@ -11,6 +11,7 @@ from detector.models.detection import Detection
 from detector.models.base import BaseDetector
 from config import DETECTION_CAPTION, DEVICE, GROUNDINGDINO_CONFIG, GROUNDINGDINO_WEIGHTS
 from do_3_razy_sztuka.utils.logger import get_logger
+import config as cfg
 from detector.GroundingDINO.groundingdino.util.inference import load_model, load_image, predict
 
 class GroundingDINODetector(BaseDetector):
@@ -100,15 +101,41 @@ class GroundingDINODetector(BaseDetector):
         h, w = image.shape[:2]
         x1, y1, x2, y2 = detection.bbox
 
-        dx = int((x2 - x1) * padding)
-        dy = int((y2 - y1) * padding)
+        # adaptive padding using global config
+        pad_frac = cfg.CROP_PADDING if hasattr(cfg, 'CROP_PADDING') else padding
+        dx = max(5, int((x2 - x1) * pad_frac))
+        dy = max(5, int((y2 - y1) * pad_frac))
 
-        x1 = max(0, x1 - dx)
-        y1 = max(0, y1 - dy)
-        x2 = min(w, x2 + dx)
-        y2 = min(h, y2 + dy)
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        half_w = (x2 - x1) // 2 + dx
+        half_h = (y2 - y1) // 2 + dy
 
-        return image[y1:y2, x1:x2]
+        # Optionally make crop square by taking max half side
+        half = max(half_w, half_h)
+
+        x0 = max(0, cx - half)
+        y0 = max(0, cy - half)
+        x1c = min(w, cx + half)
+        y1c = min(h, cy + half)
+
+        crop = image[y0:y1c, x0:x1c]
+
+        # ensure minimal crop size; optionally upscale small crops
+        side_min = int(np.sqrt(cfg.MIN_CROP_AREA)) if hasattr(cfg, 'MIN_CROP_AREA') else 20
+        if crop.size == 0:
+            return None
+        if min(crop.shape[:2]) < side_min:
+            if getattr(cfg, 'CROP_UPSCALE', False):
+                ch, cw = crop.shape[:2]
+                scale = side_min / min(ch, cw)
+                new_w = max(1, int(cw * scale))
+                new_h = max(1, int(ch * scale))
+                crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            else:
+                return None
+
+        return crop
 
     def save_results(self, image, detections, output_dir="output"):
 
@@ -121,13 +148,15 @@ class GroundingDINODetector(BaseDetector):
         for i, det in enumerate(detections):
             crop = det.crop if det.crop is not None else self.crop(image, det)
 
-            filename = f"crop_{i:03d}.jpg"
+            filename = f"det_{det.id:03d}_crop_{i:03d}.jpg"
             crop_path = crops_dir / filename
 
-            cv2.imwrite(str(crop_path), crop)
+            if crop is not None and hasattr(crop, 'size') and crop.size != 0:
+                cv2.imwrite(str(crop_path), crop)
 
             results.append({
                 "id": i,
+                "det_id": det.id,
                 "image": filename,
                 "bbox": det.bbox,
                 "confidence": float(det.confidence),
